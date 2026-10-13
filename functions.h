@@ -13,6 +13,15 @@
 #include "edm4hep/MCParticleData.h"
 #include "edm4hep/ParticleIDData.h"
 #include "ReconstructedParticle2MC.h"
+#include "ReconstructedTrack.h"
+
+// edm4hep renamed TrackerHitData -> TrackerHit3DData around key4hep 2024-10.
+// Older releases (e.g. 2023-11-23, matching the winter2023 Delphes
+// production files) only have the old name; alias it so the code below
+// compiles unchanged against either release.
+#if !__has_include("edm4hep/TrackerHit3DData.h")
+namespace edm4hep { using TrackerHit3DData = edm4hep::TrackerHitData; }
+#endif
 
 
 namespace FCCAnalyses { namespace ZHfunctions {
@@ -30,10 +39,6 @@ struct resonanceBuilder_mass_recoil {
     Vec_rp operator()(Vec_rp legs, Vec_i recind, Vec_i mcind, Vec_rp reco, Vec_mc mc, Vec_i parents, Vec_i daugthers) ;
 };
 // Function prototypes
-bool check_constraints(VertexingUtils::FCCAnalysesVertex vtx, ROOT::VecOps::RVec<edm4hep::TrackState> tracks, VertexingUtils::FCCAnalysesVertex PV, bool seed, double chi2_cut, double invM_cut, double chi2Tr_cut);
-ROOT::VecOps::RVec<int> VertexSeed_best(ROOT::VecOps::RVec<edm4hep::TrackState> tracks, VertexingUtils::FCCAnalysesVertex PV, double chi2_cut, double invM_cut);
-ROOT::VecOps::RVec<int> addTrack_best(ROOT::VecOps::RVec<edm4hep::TrackState> tracks, ROOT::VecOps::RVec<int> vtx_tr, VertexingUtils::FCCAnalysesVertex PV, double chi2_cut, double invM_cut, double chi2Tr_cut);
-ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> findSVfromTracks(ROOT::VecOps::RVec<edm4hep::TrackState> tracks_fin, const ROOT::VecOps::RVec<edm4hep::TrackState>& alltracks, ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles, VertexingUtils::FCCAnalysesVertex PV, double chi2_cut, double invM_cut, double chi2Tr_cut);
 ROOT::VecOps::RVec<double> constraints_Ks(bool tight);
 ROOT::VecOps::RVec<double> constraints_Lambda0(bool tight);
 ROOT::VecOps::RVec<double> constraints_Gamma(bool tight);
@@ -247,51 +252,6 @@ Vec_f coneIsolation::coneIsolation::operator() (Vec_rp in, Vec_rp rps) {
  
  
  
-// returns missing energy vector, based on reco particles
-Vec_rp missingEnergy(float ecm, Vec_rp in, float p_cutoff = 0.0) {
-    float px = 0, py = 0, pz = 0, e = 0;
-    for(auto &p : in) {
-        if (std::sqrt(p.momentum.x * p.momentum.x + p.momentum.y*p.momentum.y) < p_cutoff) continue;
-        px += -p.momentum.x;
-        py += -p.momentum.y;
-        pz += -p.momentum.z;
-        e += p.energy;
-    }
-    
-    Vec_rp ret;
-    rp res;
-    res.momentum.x = px;
-    res.momentum.y = py;
-    res.momentum.z = pz;
-    res.energy = ecm-e;
-    ret.emplace_back(res);
-    return ret;
-}
-
-// calculate the cosine(theta) of the missing energy vector
-float get_cosTheta_miss(Vec_rp met){
-    
-    float costheta = 0.;
-    if(met.size() > 0) {
-        
-        TLorentzVector lv_met;
-        lv_met.SetPxPyPzE(met[0].momentum.x, met[0].momentum.y, met[0].momentum.z, met[0].energy);
-        costheta = fabs(std::cos(lv_met.Theta()));
-    }
-    return costheta;
-}
-
- 
-ROOT::VecOps::RVec<TLorentzVector> build_p4(ROOT::VecOps::RVec<float> px, ROOT::VecOps::RVec<float> py, ROOT::VecOps::RVec<float> pz, ROOT::VecOps::RVec<float> mass) {
-    ROOT::VecOps::RVec<TLorentzVector> p4;
-    for (size_t i = 0; i < px.size(); ++i) {
-        TLorentzVector tlv;
-        tlv.SetXYZM(px[i], py[i], pz[i], mass[i]);
-        p4.push_back(tlv);
-    }
-    return p4;
-} 
-
 
 ROOT::VecOps::RVec<float> get_MC_Vertex_mass(ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertexMC> vertex,
                                                          ROOT::VecOps::RVec<edm4hep::MCParticleData> mc){
@@ -597,8 +557,415 @@ ROOT::VecOps::RVec<float> get_KS_mass_mumu(ROOT::VecOps::RVec<VertexingUtils::FC
     return result;
 }
 
-///// I am adding a function to get the indices of the MC particles associated to particles with reconstructed tracks.
+// get the momentum of the tracks at the vertex point
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_momentum_updated_at_vertex(ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
 
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<TVector3> p_tracks = vertex.updated_track_momentum_at_vertex;
+        ROOT::VecOps::RVec<float> magnitudes;
+        
+        for (size_t i = 0; i < p_tracks.size(); ++i) {
+            magnitudes.push_back(p_tracks[i].Mag());
+        }
+        result.push_back(magnitudes);
+    }
+    return result;
+}
+
+// get the x component of the momentum of the tracks at the vertex point
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_px_updated_at_vertex(ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<TVector3> p_tracks = vertex.updated_track_momentum_at_vertex;
+        ROOT::VecOps::RVec<float> px_values;
+        
+        for (size_t i = 0; i < p_tracks.size(); ++i) {
+            px_values.push_back(p_tracks[i].X());
+        }
+        result.push_back(px_values);
+    }
+    return result;
+}
+
+// get the y component of the momentum of the tracks at the vertex point
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_py_updated_at_vertex(ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<TVector3> p_tracks = vertex.updated_track_momentum_at_vertex;
+        ROOT::VecOps::RVec<float> py_values;
+        
+        for (size_t i = 0; i < p_tracks.size(); ++i) {
+            py_values.push_back(p_tracks[i].Y());
+        }
+        result.push_back(py_values);
+    }
+    return result;
+}
+
+// get the z component of the momentum of the tracks at the vertex point
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_pz_updated_at_vertex(ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<TVector3> p_tracks = vertex.updated_track_momentum_at_vertex;
+        ROOT::VecOps::RVec<float> pz_values;
+        
+        for (size_t i = 0; i < p_tracks.size(); ++i) {
+            pz_values.push_back(p_tracks[i].Z());
+        }
+        result.push_back(pz_values);
+    }
+    return result;
+}
+
+// omega, tanLambda, and their diagonal covariance elements (covMatrix[5],
+// covMatrix[14]) from the ORIGINAL (pre-vertex-fit) TrackState of each track
+// that formed each V0 vertex, indexed via reco_ind -> tracks_begin, reading
+// the raw EDM4hep track parameters and their covariance instead of the
+// vertex-refit momentum. This is what
+// Delphes' TrackCovariance module actually assigned to that specific track,
+// so it can be compared directly against the analytic IDEA resolution grid
+// (track_resolution/compute_track_resolution_grid.cpp) for muons vs pions.
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_omega(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].omega);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_tanLambda(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].tanLambda);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_omega_cov(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].covMatrix[5]);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_tanLambda_cov(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].covMatrix[14]);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+// D0 and Z0 (track impact parameters w.r.t. origin) for each V0 daughter leg.
+// covMatrix uses 6×6 lower-triangle row-major packing (21 elements):
+//   σ²(D0)  = covMatrix[0]   (row 0, col 0)
+//   σ²(Z0)  = covMatrix[9]   (row 3, col 3)
+// Consistent with covMatrix[5]=σ²(omega) and covMatrix[14]=σ²(tanLambda).
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_D0(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].D0);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_D0_cov(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].covMatrix[0]);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_Z0(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].Z0);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_Z0_cov(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].covMatrix[9]);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+// cov(omega, tanLambda) cross term, needed to propagate sigma(p) from the
+// track's (omega, tanLambda) covariance block: row 4 (tanLambda), col 2
+// (omega) of the 6x6 lower triangle -> index 4*5/2 + 2 = 12.
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_omega_tanLambda_cov(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackState> tracks) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> vals;
+        for (int reco_idx : vertex.reco_ind) {
+            int trk_idx = recoparticles[reco_idx].tracks_begin;
+            vals.push_back(tracks[trk_idx].covMatrix[12]);
+        }
+        result.push_back(vals);
+    }
+    return result;
+}
+
+// Reconstructed impact parameter of each V0 (K_S) candidate w.r.t. the fitted
+// primary vertex. The K_S is neutral and leaves no track of its own, so this
+// is computed purely geometrically: the V0's flight line is a straight line
+// through the fitted secondary vertex, along the direction of the summed
+// daughter momentum (vertex.updated_track_momentum_at_vertex) -- no curvature,
+// since a neutral particle isn't bent by the field. IP is the distance of
+// closest approach of that line to the primary vertex, i.e. the component of
+// (SV - PV) perpendicular to the flight direction. Same geometric definition
+// as a charged track's D0, just applied to a straight line instead of a helix.
+ROOT::VecOps::RVec<float> get_V0_impact_parameter(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        edm4hep::VertexData primaryVertex) {
+    ROOT::VecOps::RVec<float> result;
+    TVector3 pv(primaryVertex.position.x, primaryVertex.position.y, primaryVertex.position.z);
+    for (auto &vertex : vertices) {
+        TVector3 sv(vertex.vertex.position.x, vertex.vertex.position.y, vertex.vertex.position.z);
+        TVector3 p(0., 0., 0.);
+        for (auto &leg_p : vertex.updated_track_momentum_at_vertex) p += leg_p;
+        if (p.Mag() < 1e-9) { result.push_back(-1.); continue; }
+        TVector3 phat = p.Unit();
+        TVector3 d = sv - pv;
+        TVector3 perp = d - d.Dot(phat) * phat;
+        result.push_back(perp.Mag());
+    }
+    return result;
+}
+
+// Same as above, but only the transverse (x-y) component of the impact
+// parameter -- the conventional d0-like definition, if you want the value
+// directly comparable to a charged track's D0 rather than the full 3D miss
+// distance.
+ROOT::VecOps::RVec<float> get_V0_impact_parameter_xy(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        edm4hep::VertexData primaryVertex) {
+    ROOT::VecOps::RVec<float> result;
+    TVector3 pv(primaryVertex.position.x, primaryVertex.position.y, 0.);
+    for (auto &vertex : vertices) {
+        TVector3 sv(vertex.vertex.position.x, vertex.vertex.position.y, 0.);
+        TVector3 p(0., 0., 0.);
+        for (auto &leg_p : vertex.updated_track_momentum_at_vertex) p += leg_p;
+        double pt = std::sqrt(p.X()*p.X() + p.Y()*p.Y());
+        if (pt < 1e-9) { result.push_back(-1.); continue; }
+        TVector3 phat(p.X()/pt, p.Y()/pt, 0.);
+        TVector3 d = sv - pv;
+        TVector3 perp = d - d.Dot(phat) * phat;
+        result.push_back(perp.Mag());
+    }
+    return result;
+}
+
+// TOF (ps, hit at the calo entrance) of the tracks that formed each V0 vertex
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_TOF(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<edm4hep::TrackData> trackdata,          // EFlowTrack
+        ROOT::VecOps::RVec<edm4hep::TrackerHit3DData> trackerhits // TrackerHits
+        ) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<int> trk_idx;
+        for (int reco_idx : vertex.reco_ind) {
+            trk_idx.push_back(recoparticles[reco_idx].tracks_begin);
+        }
+        result.push_back(FCCAnalyses::ReconstructedTrack::tracks_TOF(trk_idx, trackdata, trackerhits));
+    }
+    return result;
+}
+
+// path length (mm) of the tracks that formed each V0 vertex
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_length(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
+        ROOT::VecOps::RVec<float> track_length // EFlowTrack_L
+        ) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<int> trk_idx;
+        for (int reco_idx : vertex.reco_ind) {
+            trk_idx.push_back(recoparticles[reco_idx].tracks_begin);
+        }
+        result.push_back(FCCAnalyses::ReconstructedTrack::tracks_length(trk_idx, track_length));
+    }
+    return result;
+}
+
+// Raw (pre-vertex-fit) momentum of the tracks that formed each V0 vertex --
+// i.e. ReconstructedParticles' own momentum, NOT the vertex-constrained
+// refit momentum (updated_track_momentum_at_vertex). This is the momentum
+// consistent with the TOF and length above, which are also derived from the
+// original, unrefit track/hits -- the vertex-fit-updated momentum comes from
+// a joint 2-track constrained refit (VertexFitterSimple.cc, GetNewPar/
+// GetMomentum) that can shift the momentum magnitude itself, not just
+// direction, so it should NOT be paired with TOF/length for a mass
+// calculation.
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_p_raw(
+        ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> vertices,
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles
+        ) {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (auto &vertex : vertices) {
+        ROOT::VecOps::RVec<float> p_values;
+        for (int reco_idx : vertex.reco_ind) {
+            auto &mom = recoparticles[reco_idx].momentum;
+            p_values.push_back(std::sqrt(mom.x*mom.x + mom.y*mom.y + mom.z*mom.z));
+        }
+        result.push_back(p_values);
+    }
+    return result;
+}
+
+// Ks flight time, per vertex, from its production point to its decay vertex
+// (= the production point of the two V0 daughters), in ps.
+//
+// TrackerHits.time (and therefore V0_tracks_TOF_ps) is measured from the
+// collision itself (t=0 at the IP), NOT from when the daughter track was
+// created. Since the Ks travels some distance before decaying, that raw TOF
+// includes the Ks's own flight time before the daughter (e.g. the muon) even
+// exists. Subtracting this t0 from V0_tracks_TOF_ps before computing beta
+// corrects for that.
+//
+// Ks production point is assumed to be the origin (the IP): a good
+// approximation for Ks produced directly in light-quark (here Z->ss)
+// hadronization, with no long-lived heavy-flavour decay chain upstream to
+// displace it further. Ks momentum is reconstructed as the vector sum of the
+// two daughter momenta at the vertex (V0_tracks_px/py/pz_at_vertex).
+ROOT::VecOps::RVec<float> get_V0_ks_t0(
+        ROOT::VecOps::RVec<float> Vertex_x, // mm, one entry per vertex
+        ROOT::VecOps::RVec<float> Vertex_y,
+        ROOT::VecOps::RVec<float> Vertex_z,
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> px_at_vertex, // GeV, 2 entries per vertex
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> py_at_vertex,
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> pz_at_vertex
+        ) {
+    const float c_mm_per_ps = 0.299792458f;
+    const float m_KS = 0.497611f; // GeV
+    ROOT::VecOps::RVec<float> result;
+    for (size_t iv = 0; iv < Vertex_x.size(); ++iv) {
+        float d = std::sqrt(Vertex_x[iv]*Vertex_x[iv] + Vertex_y[iv]*Vertex_y[iv]
+                             + Vertex_z[iv]*Vertex_z[iv]); // mm, IP -> decay vertex
+
+        float px = 0.f, py = 0.f, pz = 0.f;
+        for (size_t k = 0; k < px_at_vertex[iv].size(); ++k) {
+            px += px_at_vertex[iv][k];
+            py += py_at_vertex[iv][k];
+            pz += pz_at_vertex[iv][k];
+        }
+        float p_KS = std::sqrt(px*px + py*py + pz*pz);
+        float beta_KS = p_KS / std::sqrt(p_KS*p_KS + m_KS*m_KS);
+
+        result.push_back(beta_KS > 0.f ? d / (c_mm_per_ps * beta_KS) : 0.f);
+    }
+    return result;
+}
+
+// Same as get_V0_tracks_mass_TOF, but subtracts the per-vertex Ks flight
+// time (get_V0_ks_t0) from the raw TOF before computing beta -- i.e. uses
+// the muon's own flight time (decay vertex -> Wrapper/calo hit), not the
+// time since the collision.
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_tracks_mass_TOF(
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> momentum,   // V0_tracks_p_raw
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> length_mm,  // V0_tracks_length_mm
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> tof_ps,     // V0_tracks_TOF_ps
+        ROOT::VecOps::RVec<float> ks_t0_ps                        // get_V0_ks_t0
+        ) {
+    const float c_mm_per_ps = 0.299792458f;
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+    for (size_t iv = 0; iv < momentum.size(); ++iv) {
+        ROOT::VecOps::RVec<float> masses;
+        for (size_t k = 0; k < momentum[iv].size(); ++k) {
+            float p = momentum[iv][k];
+            float L = length_mm[iv][k];
+            float T = tof_ps[iv][k] - ks_t0_ps[iv];
+            if (L <= 0 || T <= 0) { masses.push_back(-1.f); continue; }
+            float beta = L / (c_mm_per_ps * T);
+            if (beta >= 1.f) { masses.push_back(-1.f); continue; }
+            masses.push_back(p * std::sqrt(1.f / (beta * beta) - 1.f));
+        }
+        result.push_back(masses);
+    }
+    return result;
+}
+
+
+
+///// I am adding a function to get the indices of the MC particles associated to particles with reconstructed tracks.
 ROOT::VecOps::RVec<int> get_MCindTRK(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> reco,
                                      ROOT::VecOps::RVec<edm4hep::TrackState> tracks,
                                      ROOT::VecOps::RVec<int> recind,
@@ -677,6 +1044,119 @@ ROOT::VecOps::RVec<int> get_KS_decays(const ROOT::VecOps::RVec<edm4hep::MCPartic
     return counts;
 }
 
+//A function to get the indices of those pions that are Ks' daughters
+ROOT::VecOps::RVec<int> get_Ks_pions_indices(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& particles,
+    const ROOT::VecOps::RVec<int>& daughter_indices) { 
+    
+    ROOT::VecOps::RVec<int> indices;
+    
+    for (const auto& p : particles) {
+        if (p.PDG == 310) { // Ks
+
+            for (unsigned int i = p.daughters_begin; i < p.daughters_end; ++i) {
+                
+                int daughter_idx = daughter_indices.at(i);
+                const auto& daughter = particles.at(daughter_idx);
+                
+                if (std::abs(daughter.PDG) == 211 || std::abs(daughter.PDG) == 13) {
+                    indices.push_back(daughter_idx); 
+                }
+            }
+        }
+    }
+    return indices;
+}
+
+//A function that takes the daughter of the Ks with less momentum
+ROOT::VecOps::RVec<int> get_Ks_pion_min_p_idx(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& particles,
+    const ROOT::VecOps::RVec<int>& daughter_indices) { 
+    
+    ROOT::VecOps::RVec<int> min_indices;
+    
+    for (const auto& p : particles) {
+        if (p.PDG == 310) {
+            
+            int best_idx = -1;
+            float min_p = 1e30; 
+
+            for (unsigned int i = p.daughters_begin; i < p.daughters_end; ++i) {
+                if (i >= daughter_indices.size()) continue;
+
+                int d_idx = daughter_indices.at(i);
+                const auto& d = particles.at(d_idx);
+                
+                if (std::abs(d.PDG) == 211 || std::abs(d.PDG) == 13) {
+                   
+                    float p_mag = std::sqrt(d.momentum.x*d.momentum.x + 
+                                            d.momentum.y*d.momentum.y + 
+                                            d.momentum.z*d.momentum.z);
+                    
+                    if (p_mag < min_p) {
+                        min_p = p_mag;
+                        best_idx = d_idx;
+                    }
+                }
+            }
+            
+            if (best_idx != -1) {
+                min_indices.push_back(best_idx);
+            }
+        }
+    }
+    return min_indices;
+}
+
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<int>> get_Ks_daughter_status(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& in, 
+    const ROOT::VecOps::RVec<int>& ind) {
+    
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<int>> res;
+
+    for (size_t i = 0; i < in.size(); ++i) {
+        // Buscamos el Ks (PDG 310)
+        if (std::abs(in[i].PDG) != 310) continue;
+
+        ROOT::VecOps::RVec<int> current_status;
+        
+        unsigned start = in[i].daughters_begin;
+        unsigned end = in[i].daughters_end;
+
+        for (unsigned j = start; j < end; ++j) {
+            if (j < ind.size()) {
+                int daughter_idx = ind.at(j);
+                if (daughter_idx >= 0 && static_cast<size_t>(daughter_idx) < in.size()) {
+                    current_status.push_back(in[daughter_idx].generatorStatus);
+                }
+            }
+        }
+        res.push_back(current_status);
+    }
+    return res;
+}
+
+
+ROOT::VecOps::RVec<int> get_Ks_daughter_pdg(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& in, 
+    const ROOT::VecOps::RVec<int>& ind) {
+    
+    ROOT::VecOps::RVec<int> result;
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (std::abs(in[i].PDG) == 310) {
+            for (unsigned j = in[i].daughters_begin; j < in[i].daughters_end; ++j) {
+                if (j < ind.size()) {
+                    int idx = ind.at(j);
+                    if (idx >= 0 && (size_t)idx < in.size()) result.push_back(in[idx].PDG);
+                }
+            }
+        }
+    }
+    return result;
+}
+
+
+
 ROOT::VecOps::RVec<int> get_Vertex_isMCKSpipi(
     ROOT::VecOps::RVec<int> Vertex_mcind,
     const std::vector<std::vector<int>>& PDGmother,  // These are the names of the inputs
@@ -751,7 +1231,6 @@ ROOT::VecOps::RVec<int> get_MC_Vertex_isPimunu(
     }
     return result;
 };
-
 
 //Function to get primary tracks.
 ROOT::VecOps::RVec<edm4hep::TrackState> getPrimaryTracks(
@@ -879,11 +1358,23 @@ ROOT::VecOps::RVec<edm4hep::TrackState> getSecondaryTracks(
         return secondaryTracks;
 };
 
-
-
 struct MatchMCV0 {
     std::vector<float> distance;
     std::vector<int> mc_vtx_idx;
+
+    std::vector<std::vector<int>> mc_daughter_pdg;
+    std::vector<std::vector<int>> mc_mother_pdg;
+    std::vector<std::vector<int>> mc_gmother_pdgs;
+
+    std::vector<std::vector<float>> mc_vtx_x;
+    std::vector<std::vector<float>> mc_vtx_y;
+    std::vector<std::vector<float>> mc_vtx_z;
+
+    ROOT::VecOps::RVec<int> is_valid; // 1 within tolerance, 0 for particles that formed V0 but have different origin 
+
+    std::vector<std::vector<int>> mc_daughter_indices;
+    std::vector<std::vector<int>> mc_mother_indices;
+    std::vector<std::vector<int>> mc_gmother_indices;
 };
 
 MatchMCV0 match_MC2Reco_V0s(
@@ -893,6 +1384,7 @@ MatchMCV0 match_MC2Reco_V0s(
     const ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertexMC>& mcvertices,
     ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> reco_particles,
     const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+    const ROOT::VecOps::RVec<int>& parents_ind,
     const ROOT::VecOps::RVec<float>& MC_Vertex_x, 
     const ROOT::VecOps::RVec<float>& MC_Vertex_y,
     const ROOT::VecOps::RVec<float>& MC_Vertex_z
@@ -903,91 +1395,196 @@ MatchMCV0 match_MC2Reco_V0s(
     for (const auto& vtx : recoVertices) {
         int matched_vtx_idx = -1;
         float dist = -999.0;
+
+        bool valid_mc_origin = true;
         
         // this will store the reco particles that form such reco vertex
         std::vector<int> asso_vtx_mc_particles;
+        std::vector<int> vtx_pdgs;
+        std::vector<int> vtx_mother_pdgs;
+        std::vector<int> vtx_gmother_pdgs;
+
+        std::vector<float> vtx_xs;
+        std::vector<float> vtx_ys;
+        std::vector<float> vtx_zs;
+
+        std::vector<int> mc_daughter_indices;
+        std::vector<int> mc_mother_indices;
+        std::vector<int> mc_gmother_indices;
         
-        // 1. We look for the MC particle corresponding to the daugthers (rp_idx)
         for (int rp_idx : vtx.reco_ind) {
+            bool found_mc = false; 
+
             for (size_t j = 0; j < rp2mc.size(); ++j) {
                 if (rp2mc.at(j) == rp_idx) {
                     int mc_p_id = mc2rp.at(j);
                     if (mc_p_id >= 0 && mc_p_id < (int)mc_particles.size()) {
+                        found_mc = true;
                         asso_vtx_mc_particles.push_back(mc_p_id);
+                        vtx_pdgs.push_back(mc_particles.at(mc_p_id).PDG);
+                        vtx_xs.push_back(mc_particles.at(mc_p_id).vertex.x);
+                        vtx_ys.push_back(mc_particles.at(mc_p_id).vertex.y);
+                        vtx_zs.push_back(mc_particles.at(mc_p_id).vertex.z);
+
+                        mc_daughter_indices.push_back(mc_p_id);
+                        //store index of daughter MC particle: I will need later to access the mc particle collection
+                        //and get momentum etc
+
+                        int mother_pdg = -999;
+                        int gmother_pdg = -999;
+                        unsigned int beg = mc_particles.at(mc_p_id).parents_begin;
+                        unsigned int end = mc_particles.at(mc_p_id).parents_end;
+                        int real_gmother_idx = -1;
+
+                        if (beg < end && beg < parents_ind.size()) {
+                            
+                            int real_mother_idx = parents_ind.at(beg);
+                            
+                            if (real_mother_idx >= 0 && real_mother_idx < (int)mc_particles.size()) {
+                                mother_pdg = mc_particles.at(real_mother_idx).PDG;
+
+                                mc_mother_indices.push_back(real_mother_idx);
+                                //I need to also store the index of the mother particle to be able to check later if the mother is the same for all daughters.
+                                
+                                unsigned int g_beg = mc_particles.at(real_mother_idx).parents_begin;
+                                unsigned int g_end = mc_particles.at(real_mother_idx).parents_end;
+
+                                if (g_beg < g_end && g_beg < parents_ind.size()) {
+                                    real_gmother_idx = parents_ind.at(g_beg);
+
+                                    if (real_gmother_idx >= 0 && real_gmother_idx < (int)mc_particles.size()) {
+                                        gmother_pdg = mc_particles.at(real_gmother_idx).PDG;
+                                        vtx_gmother_pdgs.push_back(gmother_pdg);
+                                        mc_gmother_indices.push_back(real_gmother_idx);
+                                    } else {
+                                        mc_gmother_indices.push_back(-1);
+                                        vtx_gmother_pdgs.push_back(-999);
+                                    }
+                                } else {
+                                    mc_gmother_indices.push_back(-1);
+                                    vtx_gmother_pdgs.push_back(0);
+                                }
+                            } else { 
+                                mc_mother_indices.push_back(-1);
+                                mc_gmother_indices.push_back(-1);
+                                vtx_gmother_pdgs.push_back(-999);
+                            }
+                        } else { 
+                            mc_mother_indices.push_back(-1);
+                            mc_gmother_indices.push_back(-1);
+                            vtx_gmother_pdgs.push_back(-999);
+                        }
+                        vtx_mother_pdgs.push_back(mother_pdg);
                     }
                     break;
                 }
             }
-        }
+
+            if (!found_mc) {
+                vtx_pdgs.push_back(0);
+                vtx_xs.push_back(-999.0);
+                vtx_ys.push_back(-999.0);
+                vtx_zs.push_back(-999.0);
+                mc_daughter_indices.push_back(-1);
+                vtx_mother_pdgs.push_back(0);
+                mc_mother_indices.push_back(-1);
+                vtx_gmother_pdgs.push_back(0);
+                mc_gmother_indices.push_back(-1);
+            }
+        } 
 
         // 2. check if daughters MC come from the same position
-        if (asso_vtx_mc_particles.size() >= 2) {
-            bool valid_mc_origin = true;
-            float tolerance = 1e-2; // Tolerance of 10 mum 
+        //if (asso_vtx_mc_particles.size() >= 2) {
+            
+         //   float tolerance = 1.0; // Tolerance of 1 mm
 
-            // vertex coordinates of first daughter MC particle found
-            float first_mc_vtx_x = mc_particles.at(asso_vtx_mc_particles[0]).vertex.x;
-            float first_mc_vtx_y = mc_particles.at(asso_vtx_mc_particles[0]).vertex.y;
-            float first_mc_vtx_z = mc_particles.at(asso_vtx_mc_particles[0]).vertex.z;
+            // Vertex coordinates of first daughter MC particle
+         //   const auto& vtx0 = mc_particles.at(asso_vtx_mc_particles[0]).vertex;
 
-            // verify that the rest of the daughters of the vertex are coming from the same origin
-            for (size_t i = 1; i < asso_vtx_mc_particles.size(); ++i) {
-                const auto& p_mc = mc_particles.at(asso_vtx_mc_particles[i]);
-                if (std::abs(p_mc.vertex.x - first_mc_vtx_x) > tolerance ||
-                    std::abs(p_mc.vertex.y - first_mc_vtx_y) > tolerance ||
-                    std::abs(p_mc.vertex.z - first_mc_vtx_z) > tolerance) {
-                    valid_mc_origin = false;
+        //    for (size_t i = 1; i < asso_vtx_mc_particles.size(); ++i) {
+        //       const auto& vtx_i = mc_particles.at(asso_vtx_mc_particles[i]).vertex;
+                
+                // Calculate distance: sqrt(dx^2 + dy^2 + dz^2)
+        //        float dx = vtx_i.x - vtx0.x;
+        //      float dy = vtx_i.y - vtx0.y;
+        //        float dz = vtx_i.z - vtx0.z;
+                
+        //       float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+          //    if (distance > tolerance) {
+            //    valid_mc_origin = false;
+              //    break;
+                //}
+            //}
+        //}
+
+            // 3. Look for the corresponding MC vertex
+         //   if (valid_mc_origin) {
+                std::vector<int> matching_mc_vertices;
+                
+               // for (size_t i = 0; i < mcvertices.size(); ++i) {
+                    //const auto& mc_vtx_indices = mcvertices.at(i).mc_ind;
+                    
+                    // Check that the mc particles are in the mc vertex
+                    //Note that if I do this, the previous check does not make sense anymore 
+                    //because mc daughters of an mc vertex have to be at least 10^-5 mm close.
+                    //for (int mc_p_id : asso_vtx_mc_particles) {
+                    //    if (std::find(mc_vtx_indices.begin(), mc_vtx_indices.end(), mc_p_id) != mc_vtx_indices.end()) {
+                    //        matching_mc_vertices.push_back(i);
+                    //        break;
+                    //    }
+                  //  }
+                //}
+
+                // calculate distance reco - mc vertex
+            //    if (!matching_mc_vertices.empty()) {
+              //      matched_vtx_idx = matching_mc_vertices[0];
+                    
+           //          float dx = vtx.vertex.position.x - MC_Vertex_x[matched_vtx_idx];
+            //        float dy = vtx.vertex.position.y - MC_Vertex_y[matched_vtx_idx];
+            //        float dz = vtx.vertex.position.z - MC_Vertex_z[matched_vtx_idx];
+            //        dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            //    }
+        //}
+
+        // CRITICAL: Validate that all daughters come from the same MC mother
+        // This prevents creating fake V0s from muons originating from different Ks particles
+        bool same_mc_mother = true;
+        if (mc_daughter_indices.size() >= 2) {
+            // Check if all mother indices are valid and identical
+            for (size_t i = 0; i < mc_mother_indices.size(); ++i) {
+                if (mc_mother_indices[i] < 0) {
+                    same_mc_mother = false;
+                    break;
+                }
+                if (i > 0 && mc_mother_indices[i] != mc_mother_indices[0]) {
+                    same_mc_mother = false;
                     break;
                 }
             }
-
-            // 3. Look for the corresponding MC vertex
-            if (valid_mc_origin) {
-                std::vector<int> matching_mc_vertices;
-                
-                for (size_t i = 0; i < mcvertices.size(); ++i) {
-                    const auto& mc_vtx_indices = mcvertices.at(i).mc_ind;
-                    
-                    // Check that the mc particles are in the mc vertex
-                    for (int mc_p_id : asso_vtx_mc_particles) {
-                        if (std::find(mc_vtx_indices.begin(), mc_vtx_indices.end(), mc_p_id) != mc_vtx_indices.end()) {
-                            matching_mc_vertices.push_back(i);
-                            break;
-                        }
-                    }
-                }
-
-                // calculate distance reco - mc vertex
-                if (!matching_mc_vertices.empty()) {
-                    matched_vtx_idx = matching_mc_vertices[0];
-                    
-                    float dx = vtx.vertex.position.x - MC_Vertex_x[matched_vtx_idx];
-                    float dy = vtx.vertex.position.y - MC_Vertex_y[matched_vtx_idx];
-                    float dz = vtx.vertex.position.z - MC_Vertex_z[matched_vtx_idx];
-                    dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-                }
-            }
+        } else {
+            same_mc_mother = false;
         }
 
         result.mc_vtx_idx.push_back(matched_vtx_idx);
         result.distance.push_back(dist);
+        result.mc_daughter_pdg.push_back(vtx_pdgs);
+        result.mc_mother_pdg.push_back(vtx_mother_pdgs);
+        result.mc_gmother_pdgs.push_back(vtx_gmother_pdgs);
+
+        result.mc_vtx_x.push_back(vtx_xs);
+        result.mc_vtx_y.push_back(vtx_ys);
+        result.mc_vtx_z.push_back(vtx_zs);
+
+        result.mc_daughter_indices.push_back(mc_daughter_indices);
+        result.mc_mother_indices.push_back(mc_mother_indices);
+        result.mc_gmother_indices.push_back(mc_gmother_indices);
+    //    result.is_valid.push_back(same_mc_mother ? 1 : 0);
     }
 
     return result;
 }
 
-//funtion to get the pdg of the matching mc vertex
-inline ROOT::VecOps::RVec<int> get_matched_pdg(const ROOT::VecOps::RVec<int>& indices, const ROOT::VecOps::RVec<int>& pdgs) {
-        ROOT::VecOps::RVec<int> result;
-        for (int idx : indices) {
-            if (idx >= 0 && idx < pdgs.size()) {
-                result.push_back(pdgs[idx]);
-            } else {
-                result.push_back(0); // Default for no match
-            }
-        }
-        return result;
-    };
 
 
 std::vector<float> get_v0_dist(MatchMCV0 res) { return res.distance; }
@@ -1151,275 +1748,7 @@ inline CloseParticles get_close_pairs(
 
 
 
-//I will add here all necessary functions for the generic V0 reconstruction.
-bool check_constraints(VertexingUtils::FCCAnalysesVertex vtx,
-		       ROOT::VecOps::RVec<edm4hep::TrackState> tracks,
-		       VertexingUtils::FCCAnalysesVertex PV,
-		       bool seed,
-		       double chi2_cut, double invM_cut, double chi2Tr_cut) {
-  // if all constraints pass -> true
-  // if any constraint fails -> false
-
-  bool result = true;
-
-  int nTr = tracks.size();  // no of tracks
-  
-  // Constraints
-  // chi2 < cut (9)
-  double chi2 = vtx.vertex.chi2; // normalised
-  double nDOF = 2*nTr - 3;       // nDOF
-  chi2 = chi2 * nDOF;
-  if(chi2 >= chi2_cut) result = false;
-  //
-  // invM < cut (10GeV)
-  double invM = VertexingUtils::get_invM(vtx);
-  if(invM >= invM_cut) result = false;
-  //
-  // invM < sum of energy
-  double E_tracks = 0.;
-  for(edm4hep::TrackState tr_e : tracks) E_tracks += VertexingUtils::get_trackE(tr_e);
-  if(invM >= E_tracks) result = false;
-  //
-  // momenta sum & vtx r on same side
-  double angle = VertexingUtils::get_PV2vtx_angle(tracks, vtx, PV);
-  if(angle<0) result = false;
-  //
-  if(!seed) {
-    // chi2_contribution(track) < threshold
-    ROOT::VecOps::RVec<float> chi2_tr = vtx.reco_chi2;
-    if(chi2_tr[nTr-1] >= chi2Tr_cut) result = false;    // threshold = 5 ok?
-  }
-  //
-  return result;
-};
-
-
-ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> findSVfromTracks(ROOT::VecOps::RVec<edm4hep::TrackState> tracks_fin,
-                                                                       const ROOT::VecOps::RVec<edm4hep::TrackState>&  alltracks,
-								       ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
-								       VertexingUtils::FCCAnalysesVertex PV,
-								       double chi2_cut, double invM_cut, double chi2Tr_cut) {
-
-  // find SVs (only if there are 2 or more tracks)
-  ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> result;
-
-  while(tracks_fin.size() > 1) {
-    // find vertex seed
-    ROOT::VecOps::RVec<int> vtx_seed = VertexSeed_best(tracks_fin, PV, chi2_cut, invM_cut);
-    
-    if(debug_me){
-      std::cout << "tracks_fin.size(): " << tracks_fin.size() << std::endl;
-      for(int i=0; i<vtx_seed.size();i++)
-	std::cout << "vtx_seed: " << vtx_seed[i] << std::endl;
-    }
-    if(vtx_seed.size() == 0) break;
-    
-    // add tracks to the seed, check if a track is added; if not break loop
-    ROOT::VecOps::RVec<int> vtx_fin = vtx_seed;
-    int vtx_fin_size = 0; // to start the loop
-    while(vtx_fin_size != vtx_fin.size()) {
-      vtx_fin_size = vtx_fin.size();
-      vtx_fin = addTrack_best(tracks_fin, vtx_fin, PV, chi2_cut, invM_cut, chi2Tr_cut);
-    }
-    
-    // fit tracks to SV and remove from tracks_fin
-    ROOT::VecOps::RVec<edm4hep::TrackState> tr_vtx_fin;
-    for(int i_tr : vtx_fin){
-      tr_vtx_fin.push_back(tracks_fin[i_tr]);
-      if(debug_me) std::cout << "Pushing back tracks_fin[i_tr]" << std::endl;
-    }
-    VertexingUtils::FCCAnalysesVertex sec_vtx = VertexFitterSimple::VertexFitter_Tk(2, tr_vtx_fin); // flag 2 for SVs
-
-    for (int i = 0; i < recoparticles.size(); i++) {
-        auto &p = recoparticles[i];
-        if (p.tracks_begin >= 0 && p.tracks_begin < alltracks.size()) {
-            
-            edm4hep::TrackState track_from_reco = alltracks[p.tracks_begin];
-            
-            for (auto &track_in_vertex : tr_vtx_fin) {
-                if (VertexingUtils::compare_Tracks(track_from_reco, track_in_vertex)) {
-                    sec_vtx.reco_ind.push_back(i);
-                    break;
-                }
-            }
-        }
-    }
-
-    result.push_back(sec_vtx);
-    //
-    ROOT::VecOps::RVec<edm4hep::TrackState> temp = tracks_fin;
-    tracks_fin.clear();
-    for(unsigned int t=0; t<temp.size(); t++) {
-      if(std::find(vtx_fin.begin(), vtx_fin.end(), t) == vtx_fin.end()) tracks_fin.push_back(temp[t]);
-    }    // all this cause don't know how to remove multiple elements at once
-
-    if(debug_me) std::cout<<result.size()<<" SV found"<<std::endl;
-  }
-
-  //
-  return result;
-}
-
-ROOT::VecOps::RVec<bool> IsPrimary_forTracks(ROOT::VecOps::RVec<edm4hep::TrackState> allTracks,
-                    ROOT::VecOps::RVec<edm4hep::TrackState> primaryTracks) {
-
-  ROOT::VecOps::RVec<bool> result;
-  for (auto &track : allTracks) {
-    bool isInPrimary = false;
-    for (auto &primary : primaryTracks) {
-      if (VertexingUtils::compare_Tracks(track, primary)) {
-        isInPrimary = true;
-        break;
-      }
-    }
-    result.push_back(isInPrimary);
-  }
-  return result;
-}
-
-ROOT::VecOps::RVec<int> VertexSeed_best(ROOT::VecOps::RVec<edm4hep::TrackState> tracks,
-					VertexingUtils::FCCAnalysesVertex PV,
-					double chi2_cut, double invM_cut) {
-
-  // gives indices of the best pair of tracks
-
-  ROOT::VecOps::RVec<int> result;
-  int isel = 0;
-  int jsel = 1;
-  
-  int nTr = tracks.size();
-  // push empty tracks to make a size=2 vector
-  ROOT::VecOps::RVec<edm4hep::TrackState> tr_pair;
-  edm4hep::TrackState tr_i, tr_j;
-  tr_pair.push_back(tr_i);
-  tr_pair.push_back(tr_j);
-  VertexingUtils::FCCAnalysesVertex vtx_seed;
-  double chi2_min = 99;
-  
-  for(unsigned int i=0; i<nTr-1; i++) {
-    tr_pair[0] = tracks[i];
-    
-    for(unsigned int j=i+1; j<nTr; j++) {
-      tr_pair[1] = tracks[j];
-      
-      vtx_seed = VertexFitterSimple::VertexFitter_Tk(2, tr_pair);
-      
-      // Constraints check
-      bool pass = check_constraints(vtx_seed, tr_pair, PV, true, chi2_cut, invM_cut, 30.0);
-      if(!pass) continue;
-      
-      // if a pair passes all constraints compare chi2, store lowest chi2
-      double chi2_seed = vtx_seed.vertex.chi2; // normalised but nDOF=1 for nTr=2      
-      if(chi2_seed < chi2_min) {
-	isel = i; jsel =j;
-	chi2_min = chi2_seed;
-      }
-    }
-  }
-
-  if(chi2_min != 99){
-    result.push_back(isel); 
-    result.push_back(jsel);
-  }
-  return result;
-}
-
-
-ROOT::VecOps::RVec<int> addTrack_best(ROOT::VecOps::RVec<edm4hep::TrackState> tracks,
-				      ROOT::VecOps::RVec<int> vtx_tr,
-				      VertexingUtils::FCCAnalysesVertex PV,
-				      double chi2_cut, double invM_cut, double chi2Tr_cut) {
-  // adds index of the best track to the (seed) vtx
-  
-  ROOT::VecOps::RVec<int> result = vtx_tr;
-  if(tracks.size() == vtx_tr.size()) return result;
-  
-  int isel = -1;
-
-  int nTr = tracks.size();
-  ROOT::VecOps::RVec<edm4hep::TrackState> tr_vtx;
-  VertexingUtils::FCCAnalysesVertex vtx;
-  double chi2_min = 99;
-
-  // add tracks of the previously formed vtx to a vector
-  for(int tr : vtx_tr) {
-    if(debug_me) std::cout << "Track integer: " << tr << std::endl;
-    if(debug_me) std::cout <<  "Track value: " << tracks[tr] << std::endl;
-    tr_vtx.push_back(tracks[tr]);
-  }
-  int iTr = tr_vtx.size();
-  // add an empty track to increase vector size by 1
-  edm4hep::TrackState tr_i;
-  tr_vtx.push_back(tr_i);
-
-  // find best track to add to the vtx
-  for(unsigned int i=0; i<nTr; i++) {
-    if(std::find(vtx_tr.begin(), vtx_tr.end(), i) != vtx_tr.end()) continue;
-    tr_vtx[iTr] = tracks[i];
-    
-    vtx = VertexFitterSimple::VertexFitter_Tk(2, tr_vtx);
-
-    // Constraints
-    bool pass = check_constraints(vtx, tr_vtx, PV, false, chi2_cut, invM_cut, chi2Tr_cut);
-    if(!pass) continue;
-    
-    // if a track passes all constraints compare chi2, store lowest chi2
-    double chi2_vtx = vtx.vertex.chi2; // normalised
-    double nDOF = 2*(iTr+1) - 3;       // nDOF = 2*nTr - 3
-    chi2_vtx = chi2_vtx * nDOF;
-    if(chi2_vtx < chi2_min) {
-      isel = i;
-      chi2_min = chi2_vtx;
-    }    
-  }
-
-  if(isel>=0) result.push_back(isel);
-  return result;
-};
-
-
-ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> get_SV_event(ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> recoparticles,
-								   ROOT::VecOps::RVec<edm4hep::TrackState> thetracks,
-								   VertexingUtils::FCCAnalysesVertex PV,
-								   ROOT::VecOps::RVec<bool> isInPrimary,
-								   bool V0_rej,
-								   double chi2_cut, double invM_cut, double chi2Tr_cut) {
-    
-  // find SVs using LCFI+ (w/o clustering)
-
-  ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex> result;
-
-  // retrieve the tracks associated to the recoparticles
-  ROOT::VecOps::RVec<edm4hep::TrackState> tracks = ReconstructedParticle2Track::getRP2TRK( recoparticles, thetracks );
-
-  if(debug_me) std::cout<<"tracks extracted from the reco particles"<<std::endl;
-
-  if(tracks.size() != isInPrimary.size()) std::cout<<"ISSUE: track vector and primary-nonprimary vector of diff sizes"<<std::endl;
-
-  // remove primary tracks
-  ROOT::VecOps::RVec<edm4hep::TrackState> np_tracks;
-  for(unsigned int i=0; i<tracks.size(); i++) {
-    if (!isInPrimary[i]) np_tracks.push_back(tracks[i]);
-  }
-
-  if(debug_me) std::cout<<"primary tracks removed; there are "<<np_tracks.size()<<" non-primary tracks in the event"<<std::endl;
-  
-  //if(debug_me) std::cout << "tracks_fin.size() = " << tracks_fin.size() << std::endl;
-
-  // start finding SVs (only if there are 2 or more tracks)
-  result = findSVfromTracks(np_tracks, thetracks, recoparticles, PV, chi2_cut, invM_cut, chi2Tr_cut);
-
-  //if(debug_me) std::cout<<"no more SVs can be reconstructed"<<std::endl;
-  
-  return result;
-}
-
-
 //add all functions to reconstruct V0s
-
-///////////////////////////
-//** V0 Reconstruction **//
-///////////////////////////
 
 VertexingUtils::FCCAnalysesV0 get_V0s(ROOT::VecOps::RVec<edm4hep::TrackState> np_tracks,
                                       const ROOT::VecOps::RVec<edm4hep::TrackState>& alltracks,
@@ -1438,6 +1767,7 @@ VertexingUtils::FCCAnalysesV0 get_V0s(ROOT::VecOps::RVec<edm4hep::TrackState> np
   result.vtx = vtx;
   result.pdgAbs = pdgAbs;
   result.invM = invM;
+
 
   VertexingUtils::FCCAnalysesVertex V0_vtx;
   
@@ -1572,7 +1902,7 @@ if(debug_me) std::cout<<"Found a Photon coversion"<<std::endl;
         break;
       }
       //dimuon 
-        // dimuon
+
       else if(V0_cand[4]>isKs[0] && V0_cand[4]<isKs[1] && V0_cand[5]>isKs[2] && V0_cand[6]>isKs[3]) {
         if (debug_me) std::cout<<"Found a dimuon"<<std::endl;
         isInV0[i] = true;
@@ -1702,10 +2032,860 @@ ROOT::VecOps::RVec<double> constraints_Gamma(bool tight) {
   return result;
 }
 
+// I will add a function to look for muons that come from pions and check if those pions come from Kaons.
+// Loop over all MC particles and identify the decay chain:
+//     K0S -> pi± -> mu±
+//
+// For every muon found in the event:
+//   1. Check whether its direct mother is a charged pion (PDG = ±211)
+//   2. If true, check whether that pion comes from a KS (PDG = 310)
+//   3. Store the indices of the muon, pion, and KS
+//
+// The function returns a struct containing:
+//   - muon indices
+//   - pion mother indices
+//   - KS grandmother indices
+struct PiMuFromKs {
+    ROOT::VecOps::RVec<int> mu_idx;   // muon MC index (from pi->mu nu)
+    ROOT::VecOps::RVec<int> pi_idx;   // decaying pion MC index (no reco track in Delphes)
+    ROOT::VecOps::RVec<int> ks_idx;   // Ks MC index
+    ROOT::VecOps::RVec<int> pi2_idx;  // stable sibling pion MC index (the other Ks daughter)
+};
+
+// Particle0 = Particle#0.index (parent links), Particle1 = Particle#1.index (daughter links)
+PiMuFromKs get_PiMuFromKs(
+    ROOT::VecOps::RVec<edm4hep::MCParticleData> particles,
+    ROOT::VecOps::RVec<int> Particle0,
+    ROOT::VecOps::RVec<int> Particle1
+) {
+    PiMuFromKs result;
+    for (size_t i = 0; i < particles.size(); ++i) {
+        const auto& mu = particles.at(i);
+        if (std::abs(mu.PDG) != 13) continue;
+        if (mu.parents_begin >= mu.parents_end) continue;
+        for (size_t j = mu.parents_begin; j < mu.parents_end; ++j) {
+            if (j >= Particle0.size()) continue;
+            int pi_idx = Particle0.at(j);
+            if (pi_idx < 0 || pi_idx >= (int)particles.size()) continue;
+            const auto& pion = particles.at(pi_idx);
+            if (std::abs(pion.PDG) != 211) continue;
+            if (pion.parents_begin >= pion.parents_end) continue;
+            for (size_t k = pion.parents_begin; k < pion.parents_end; ++k) {
+                if (k >= Particle0.size()) continue;
+                int ks_idx = Particle0.at(k);
+                if (ks_idx < 0 || ks_idx >= (int)particles.size()) continue;
+                const auto& ks = particles.at(ks_idx);
+                if (ks.PDG != 310) continue;
+
+                // Find the stable sibling pion: the other charged daughter of this Ks
+                int pi2_idx = -1;
+                for (int d = ks.daughters_begin; d < ks.daughters_end; ++d) {
+                    if (d < 0 || d >= (int)Particle1.size()) continue;
+                    int dau = Particle1.at(d);
+                    if (dau < 0 || dau >= (int)particles.size()) continue;
+                    if (dau == pi_idx) continue;
+                    if (std::abs(particles.at(dau).PDG) == 211) { pi2_idx = dau; break; }
+                }
+
+                result.mu_idx.push_back(i);
+                result.pi_idx.push_back(pi_idx);
+                result.ks_idx.push_back(ks_idx);
+                result.pi2_idx.push_back(pi2_idx);
+            }
+        }
+    }
+    return result;
+}
+
+// For each Ks->pi->mu pair identified by get_PiMuFromKs, return the reconstructed
+// track states of the pion and muon by walking the MC-Reco association table.
+// For each Ks->pi->mu pair, retrieve the reco track states of:
+//   - the muon (from pi->mu nu, has a reco track in Delphes)
+//   - the stable pion pi2 (the other Ks daughter that did NOT decay in flight)
+// The decaying pion itself has no reco track in Delphes parametric simulation.
+// Results are stored as consecutive pairs: [mu_ts, pi2_ts, mu_ts, pi2_ts, ...]
+ROOT::VecOps::RVec<edm4hep::TrackState> get_pimu_reco_tracks(
+    const ROOT::VecOps::RVec<int>& mu_mc_idx,
+    const ROOT::VecOps::RVec<int>& pi2_mc_idx,  // stable sibling pion from same Ks
+    const ROOT::VecOps::RVec<int>& assoc_reco,   // MCRecoAssociations#0.index
+    const ROOT::VecOps::RVec<int>& assoc_mc,     // MCRecoAssociations#1.index
+    const ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData>& RecoParticles,
+    const ROOT::VecOps::RVec<edm4hep::TrackState>& AllTracks)
+{
+    ROOT::VecOps::RVec<edm4hep::TrackState> result;
+
+    // Build MC index → reco index map
+    std::unordered_map<int,int> mc2reco;
+    mc2reco.reserve(assoc_mc.size());
+    for (size_t j = 0; j < assoc_mc.size(); ++j)
+        mc2reco[assoc_mc[j]] = assoc_reco[j];
+
+    size_t n = std::min(mu_mc_idx.size(), pi2_mc_idx.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (pi2_mc_idx[i] < 0) continue;  // no sibling pion found
+        auto it_mu  = mc2reco.find(mu_mc_idx[i]);
+        auto it_pi2 = mc2reco.find(pi2_mc_idx[i]);
+        if (it_mu == mc2reco.end() || it_pi2 == mc2reco.end()) continue;
+
+        int mu_reco  = it_mu->second;
+        int pi2_reco = it_pi2->second;
+        if (mu_reco  < 0 || mu_reco  >= (int)RecoParticles.size()) continue;
+        if (pi2_reco < 0 || pi2_reco >= (int)RecoParticles.size()) continue;
+
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> mu_rp  = {RecoParticles[mu_reco]};
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> pi2_rp = {RecoParticles[pi2_reco]};
+        auto mu_ts  = FCCAnalyses::ReconstructedParticle2Track::getRP2TRK(mu_rp,  AllTracks);
+        auto pi2_ts = FCCAnalyses::ReconstructedParticle2Track::getRP2TRK(pi2_rp, AllTracks);
+
+        if (mu_ts.empty() || pi2_ts.empty()) continue;
+        result.push_back(mu_ts[0]);
+        result.push_back(pi2_ts[0]);
+    }
+    return result;
+}
 
 
+// Returns the 0-based indices (into the MC pair list) of pairs where both tracks were found.
+// Use with ROOT::VecOps::Take(pimu_mc_ksdec_r, pimu_found_idx) to get the "found" sub-distribution.
+ROOT::VecOps::RVec<int> get_pimu_found_idx(
+    const ROOT::VecOps::RVec<int>& mu_mc_idx,
+    const ROOT::VecOps::RVec<int>& pi2_mc_idx,
+    const ROOT::VecOps::RVec<int>& assoc_reco,
+    const ROOT::VecOps::RVec<int>& assoc_mc,
+    const ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData>& RecoParticles,
+    const ROOT::VecOps::RVec<edm4hep::TrackState>& AllTracks)
+{
+    ROOT::VecOps::RVec<int> result;
+
+    std::unordered_map<int,int> mc2reco;
+    mc2reco.reserve(assoc_mc.size());
+    for (size_t j = 0; j < assoc_mc.size(); ++j)
+        mc2reco[assoc_mc[j]] = assoc_reco[j];
+
+    size_t n = std::min(mu_mc_idx.size(), pi2_mc_idx.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (pi2_mc_idx[i] < 0) continue;
+        auto it_mu  = mc2reco.find(mu_mc_idx[i]);
+        auto it_pi2 = mc2reco.find(pi2_mc_idx[i]);
+        if (it_mu == mc2reco.end() || it_pi2 == mc2reco.end()) continue;
+
+        int mu_reco  = it_mu->second;
+        int pi2_reco = it_pi2->second;
+        if (mu_reco  < 0 || mu_reco  >= (int)RecoParticles.size()) continue;
+        if (pi2_reco < 0 || pi2_reco >= (int)RecoParticles.size()) continue;
+
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> mu_rp  = {RecoParticles[mu_reco]};
+        ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData> pi2_rp = {RecoParticles[pi2_reco]};
+        auto mu_ts  = FCCAnalyses::ReconstructedParticle2Track::getRP2TRK(mu_rp,  AllTracks);
+        auto pi2_ts = FCCAnalyses::ReconstructedParticle2Track::getRP2TRK(pi2_rp, AllTracks);
+
+        if (mu_ts.empty() || pi2_ts.empty()) continue;
+        result.push_back((int)i);
+    }
+    return result;
+}
+
+// Invariant mass (GeV) of a two-body system under the muon mass hypothesis for both particles.
+// idx1 and idx2 are MC particle indices; both are assigned m_mu regardless of their true identity.
+// Used to compare: idx1=pi (decaying pion treated as mu) vs idx1=mu (true muon) — both paired with pi2.
+ROOT::VecOps::RVec<float> get_pimu_invM_mumu_hyp(
+    const ROOT::VecOps::RVec<int>& idx1,
+    const ROOT::VecOps::RVec<int>& idx2,
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& particles)
+{
+    const float m_mu = 0.10566f; // GeV
+    ROOT::VecOps::RVec<float> result;
+    size_t n = std::min(idx1.size(), idx2.size());
+    result.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        int i1 = idx1[i], i2 = idx2[i];
+        if (i1 < 0 || i2 < 0) { result.push_back(-1.f); continue; }
+        auto& p1 = particles[i1].momentum;
+        auto& p2 = particles[i2].momentum;
+        float p1sq = p1.x*p1.x + p1.y*p1.y + p1.z*p1.z;
+        float p2sq = p2.x*p2.x + p2.y*p2.y + p2.z*p2.z;
+        float E1 = std::sqrt(p1sq + m_mu*m_mu);
+        float E2 = std::sqrt(p2sq + m_mu*m_mu);
+        float px = p1.x + p2.x, py = p1.y + p2.y, pz = p1.z + p2.z;
+        float M2 = (E1+E2)*(E1+E2) - px*px - py*py - pz*pz;
+        result.push_back(M2 > 0.f ? std::sqrt(M2) : 0.f);
+    }
+    return result;
+}
+
+
+// Step 1: for each V0, extract the Ks MC index from the nested mother-index table.
+// Returns -1 for V0s not matched to a Ks (PDG 310) mother.
+struct extract_V0_ks_idx {
+    ROOT::VecOps::RVec<int> operator()(
+        const std::vector<std::vector<int>>& V0_mother_idx,
+        const std::vector<std::vector<int>>& V0_mother_pdg)
+    {
+        ROOT::VecOps::RVec<int> result;
+        result.reserve(V0_mother_idx.size());
+        for (size_t v = 0; v < V0_mother_idx.size(); ++v) {
+            int idx = -1;
+            if (v < V0_mother_pdg.size()) {
+                const auto& mothers = V0_mother_idx[v];
+                const auto& mpdgs   = V0_mother_pdg[v];
+                for (size_t t = 0; t < mothers.size() && t < mpdgs.size(); ++t) {
+                    if (std::abs(mpdgs[t]) == 310) { idx = mothers[t]; break; }
+                }
+            }
+            result.push_back(idx);
+        }
+        return result;
+    }
+};
+
+// Step 2: for each V0, look up the opening angle between the decaying pion and the muon
+// using the Ks MC index extracted by extract_V0_ks_idx. Returns -1 if no match.
+ROOT::VecOps::RVec<float> get_V0_pimu_opening_angle(
+    const ROOT::VecOps::RVec<int>& V0_ks_idx,
+    const PiMuFromKs& pimu_cands,
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& particles)
+{
+    // Build map: Ks MC index -> opening angle between decaying pi and muon
+    std::unordered_map<int, float> ks_to_angle;
+    size_t n = std::min({pimu_cands.ks_idx.size(), pimu_cands.pi_idx.size(), pimu_cands.mu_idx.size()});
+    for (size_t i = 0; i < n; ++i) {
+        int ks_i = pimu_cands.ks_idx[i], pi_i = pimu_cands.pi_idx[i], mu_i = pimu_cands.mu_idx[i];
+        if (ks_i < 0 || pi_i < 0 || mu_i < 0) continue;
+        if (pi_i >= (int)particles.size() || mu_i >= (int)particles.size()) continue;
+        const auto& p_pi = particles[pi_i].momentum;
+        const auto& p_mu = particles[mu_i].momentum;
+        float mag_pi = std::sqrt(p_pi.x*p_pi.x + p_pi.y*p_pi.y + p_pi.z*p_pi.z);
+        float mag_mu = std::sqrt(p_mu.x*p_mu.x + p_mu.y*p_mu.y + p_mu.z*p_mu.z);
+        if (mag_pi <= 0.f || mag_mu <= 0.f) continue;
+        float cosine = (p_pi.x*p_mu.x + p_pi.y*p_mu.y + p_pi.z*p_mu.z) / (mag_pi * mag_mu);
+        cosine = std::max(-1.f, std::min(1.f, cosine));
+        ks_to_angle[ks_i] = std::acos(cosine);
+    }
+
+    ROOT::VecOps::RVec<float> result;
+    result.reserve(V0_ks_idx.size());
+    for (int ks_i : V0_ks_idx) {
+        if (ks_i < 0) { result.push_back(-1.f); continue; }
+        auto it = ks_to_angle.find(ks_i);
+        result.push_back(it != ks_to_angle.end() ? it->second : -1.f);
+    }
+    return result;
+}
+
+
+// Return the momentum magnitude of one track (by index 0 or 1) for each fitted pimu vertex.
+ROOT::VecOps::RVec<float> get_pimu_vtx_track_p(
+    const ROOT::VecOps::RVec<VertexingUtils::FCCAnalysesVertex>& vtx,
+    int track_idx)
+{
+    ROOT::VecOps::RVec<float> result;
+    for (const auto& v : vtx) {
+        if (track_idx < (int)v.updated_track_momentum_at_vertex.size())
+            result.push_back(v.updated_track_momentum_at_vertex[track_idx].Mag());
+        else
+            result.push_back(-1.f);
+    }
+    return result;
+}
+
+
+ROOT::VecOps::RVec<float> get_pimu_vtx_p_min(
+    const ROOT::VecOps::RVec<float>& p_mu,
+    const ROOT::VecOps::RVec<float>& p_pi)
+{
+    ROOT::VecOps::RVec<float> result;
+    size_t n = std::min(p_mu.size(), p_pi.size());
+    result.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        result.push_back(std::min(p_mu[i], p_pi[i]));
+    return result;
+}
+
+
+ROOT::VecOps::RVec<float> get_MC_vertex_x_from_indices(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mcparticle,
+    const ROOT::VecOps::RVec<int>& indices) {
+
+    ROOT::VecOps::RVec<float> result;
+
+    for (int idx : indices) {
+        result.push_back(mcparticle[idx].vertex.x);
+    }
+
+    return result;
+}
+
+ROOT::VecOps::RVec<float> get_MC_vertex_y_from_indices(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mcparticle,
+    const ROOT::VecOps::RVec<int>& indices) {
+
+    ROOT::VecOps::RVec<float> result;
+
+    for (int idx : indices) {
+        result.push_back(mcparticle[idx].vertex.y);
+    }
+
+    return result;
+}
+
+ROOT::VecOps::RVec<float> get_MC_vertex_z_from_indices(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mcparticle,
+    const ROOT::VecOps::RVec<int>& indices) {
+
+    ROOT::VecOps::RVec<float> result;
+
+    for (int idx : indices) {
+        result.push_back(mcparticle[idx].vertex.z);
+    }
+
+    return result;
+}
+
+ROOT::VecOps::RVec<float> get_MC_pt_from_indices(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mcparticle,
+    const ROOT::VecOps::RVec<int>& indices) {
+
+    ROOT::VecOps::RVec<float> result;
+
+    for (int idx : indices) {
+
+        float px = mcparticle[idx].momentum.x;
+        float py = mcparticle[idx].momentum.y;
+
+        result.push_back(std::sqrt(px*px + py*py));
+    }
+
+    return result;
+}
+
+ROOT::VecOps::RVec<float> get_pi_mu_opening_angle(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mcparticle,
+    const ROOT::VecOps::RVec<int>& mu_idx,
+    const ROOT::VecOps::RVec<int>& pi_idx) {
+
+    ROOT::VecOps::RVec<float> result;
+
+    for (size_t i = 0; i < mu_idx.size(); ++i) {
+
+        const auto& mu = mcparticle[mu_idx[i]];
+        const auto& pi = mcparticle[pi_idx[i]];
+
+        float mu_px = mu.momentum.x;
+        float mu_py = mu.momentum.y;
+        float mu_pz = mu.momentum.z;
+
+        float pi_px = pi.momentum.x;
+        float pi_py = pi.momentum.y;
+        float pi_pz = pi.momentum.z;
+
+        float dot =
+            mu_px*pi_px +
+            mu_py*pi_py +
+            mu_pz*pi_pz;
+
+        float mu_p =
+            std::sqrt(mu_px*mu_px +
+                      mu_py*mu_py +
+                      mu_pz*mu_pz);
+
+        float pi_p =
+            std::sqrt(pi_px*pi_px +
+                      pi_py*pi_py +
+                      pi_pz*pi_pz);
+
+        float cos_theta = dot/(mu_p*pi_p);
+
+        // protection against numerical precision
+        cos_theta = std::max(-1.f, std::min(1.f, cos_theta));
+
+        result.push_back(std::acos(cos_theta));
+    }
+
+    return result;
+}
+
+ROOT::VecOps::RVec<float> get_MC_p_from_indices(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& parts,
+    const ROOT::VecOps::RVec<int>& indices) {
+
+    ROOT::VecOps::RVec<float> result;
+    result.reserve(indices.size());
+
+    for (int idx : indices) {
+        if (idx >= 0 && idx < (int)parts.size()) {
+
+            const auto& p = parts[idx];
+
+            float px = p.momentum.x;
+            float py = p.momentum.y;
+            float pz = p.momentum.z;
+
+            result.push_back(std::sqrt(px*px + py*py + pz*pz));
+        } else {
+            result.push_back(-1.0); // safety flag
+        }
+    }
+
+    return result;
+}
+
+
+// 1. Momentos de las hijas
+struct get_nested_daughter_p {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& daughter_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : daughter_indices) {
+            ROOT::VecOps::RVec<float> vtx_p;
+            for (int idx : indices) {
+                if (idx >= 0 && idx < (int)mc_particles.size()) {
+                    auto& p = mc_particles.at(idx).momentum;
+                    float p_mag = std::sqrt(p.x*p.x + p.y*p.y + p.z*p.z);
+                    vtx_p.push_back(p_mag);
+                } else {
+                    vtx_p.push_back(-999.0);
+                }
+            }
+            result.push_back(vtx_p);
+        }
+        return result;
+    }
+};
+
+struct get_nested_daughter_px {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& daughter_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : daughter_indices) {
+            ROOT::VecOps::RVec<float> vals;
+            for (int idx : indices) {
+                vals.push_back(idx >= 0 && idx < (int)mc_particles.size() ? mc_particles.at(idx).momentum.x : -999.0f);
+            }
+            result.push_back(vals);
+        }
+        return result;
+    }
+};
+
+struct get_nested_daughter_py {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& daughter_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : daughter_indices) {
+            ROOT::VecOps::RVec<float> vals;
+            for (int idx : indices) {
+                vals.push_back(idx >= 0 && idx < (int)mc_particles.size() ? mc_particles.at(idx).momentum.y : -999.0f);
+            }
+            result.push_back(vals);
+        }
+        return result;
+    }
+};
+
+struct get_nested_daughter_pz {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& daughter_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : daughter_indices) {
+            ROOT::VecOps::RVec<float> vals;
+            for (int idx : indices) {
+                vals.push_back(idx >= 0 && idx < (int)mc_particles.size() ? mc_particles.at(idx).momentum.z : -999.0f);
+            }
+            result.push_back(vals);
+        }
+        return result;
+    }
+};
+
+// Momentos de las madres
+struct get_nested_mother_p {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& mother_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : mother_indices) {
+            ROOT::VecOps::RVec<float> vtx_p;
+            for (int idx : indices) {
+                if (idx >= 0 && idx < (int)mc_particles.size()) {
+                    auto& p = mc_particles.at(idx).momentum;
+                    float p_mag = std::sqrt(p.x*p.x + p.y*p.y + p.z*p.z);
+                    vtx_p.push_back(p_mag);
+                } else {
+                    vtx_p.push_back(-999.0);
+                }
+            }
+            result.push_back(vtx_p);
+        }
+        return result;
+    }
+};
+
+struct get_nested_mother_px {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& mother_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : mother_indices) {
+            ROOT::VecOps::RVec<float> vals;
+            for (int idx : indices) {
+                vals.push_back(idx >= 0 && idx < (int)mc_particles.size() ? mc_particles.at(idx).momentum.x : -999.0f);
+            }
+            result.push_back(vals);
+        }
+        return result;
+    }
+};
+
+struct get_nested_mother_py {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& mother_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : mother_indices) {
+            ROOT::VecOps::RVec<float> vals;
+            for (int idx : indices) {
+                vals.push_back(idx >= 0 && idx < (int)mc_particles.size() ? mc_particles.at(idx).momentum.y : -999.0f);
+            }
+            result.push_back(vals);
+        }
+        return result;
+    }
+};
+
+struct get_nested_mother_pz {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const std::vector<std::vector<int>>& mother_indices)
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> result;
+        for (const auto& indices : mother_indices) {
+            ROOT::VecOps::RVec<float> vals;
+            for (int idx : indices) {
+                vals.push_back(idx >= 0 && idx < (int)mc_particles.size() ? mc_particles.at(idx).momentum.z : -999.0f);
+            }
+            result.push_back(vals);
+        }
+        return result;
+    }
+};
+
+// 3. PDG de las abuelas
+struct get_nested_gmother_pdg {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<int>> operator()(
+        const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc_particles,
+        const ROOT::VecOps::RVec<int>& parents_ind,
+        const std::vector<std::vector<int>>& mother_indices) // <-- Cambiado aquí
+    {
+        ROOT::VecOps::RVec<ROOT::VecOps::RVec<int>> result;
+        for (const auto& indices : mother_indices) {
+            ROOT::VecOps::RVec<int> vtx_gmother_pdg;
+            for (int m_idx : indices) {
+                if (m_idx >= 0 && m_idx < (int)mc_particles.size()) {
+                    const auto& mother = mc_particles.at(m_idx);
+                    if (mother.parents_end > mother.parents_begin && mother.parents_begin < parents_ind.size()) {
+                        int gm_idx = parents_ind.at(mother.parents_begin);
+                        if (gm_idx >= 0 && gm_idx < (int)mc_particles.size()) {
+                            vtx_gmother_pdg.push_back(mc_particles.at(gm_idx).PDG);
+                        } else {
+                            vtx_gmother_pdg.push_back(-999);
+                        }
+                    } else {
+                        vtx_gmother_pdg.push_back(0);
+                    }
+                } else {
+                    vtx_gmother_pdg.push_back(-999);
+                }
+            }
+            result.push_back(vtx_gmother_pdg);
+        }
+        return result;
+    }
+};
+
+// Pure generator-truth kinematics for KS -> pi1 pi2, pi1 -> mu nu decays.
+// For every KS with exactly two pion daughters where exactly one of them
+// decays in-flight to mu+nu, stores the true muon 4-momentum, the sibling
+// pion's true 4-momentum, its energy recomputed under the muon-mass
+// hypothesis (3-momentum unchanged), the resulting mu-mu invariant mass
+// under that hypothesis, and the true KS 4-momentum. No reco.
+struct PimunuGenTruth {
+    ROOT::VecOps::RVec<float> KS_p;
+    ROOT::VecOps::RVec<float> m_mumu_muhyp;
+};
+
+PimunuGenTruth get_KS_pimunu_gentruth(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc,
+    const ROOT::VecOps::RVec<int>& daughter_ind) // Particle1 = Particle#1.index
+{
+    PimunuGenTruth res;
+    constexpr double m_mu = 0.1056583755; // PDG muon mass [GeV]
+
+    auto find_muon_daughter = [&](int idx) -> int {
+        const auto& p = mc.at(idx);
+        for (unsigned j = p.daughters_begin; j < p.daughters_end; ++j) {
+            if (j >= daughter_ind.size()) continue;
+            int dau = daughter_ind.at(j);
+            if (dau >= 0 && (size_t)dau < mc.size() && std::abs(mc.at(dau).PDG) == 13) return dau;
+        }
+        return -1;
+    };
+
+    for (size_t i = 0; i < mc.size(); ++i) {
+        if (mc[i].PDG != 310) continue; // KS
+        const auto& ks = mc[i];
+        if (ks.daughters_end - ks.daughters_begin != 2) continue;
+        if (ks.daughters_begin + 1 >= daughter_ind.size()) continue;
+
+        int d0 = daughter_ind.at(ks.daughters_begin);
+        int d1 = daughter_ind.at(ks.daughters_begin + 1);
+        if (d0 < 0 || d1 < 0 || (size_t)d0 >= mc.size() || (size_t)d1 >= mc.size()) continue;
+        if (std::abs(mc[d0].PDG) != 211 || std::abs(mc[d1].PDG) != 211) continue; // both pions
+
+        int mu_from_d0 = find_muon_daughter(d0);
+        int mu_from_d1 = find_muon_daughter(d1);
+
+        int pi2_idx = -1, mu_idx = -1;
+        if (mu_from_d0 >= 0 && mu_from_d1 < 0)      { pi2_idx = d1; mu_idx = mu_from_d0; }
+        else if (mu_from_d1 >= 0 && mu_from_d0 < 0) { pi2_idx = d0; mu_idx = mu_from_d1; }
+        else continue; // neither or both decayed to mu nu -> not this channel / ambiguous
+
+        const auto& mu  = mc.at(mu_idx);
+        const auto& pi2 = mc.at(pi2_idx);
+
+        double mu_p2 = mu.momentum.x*mu.momentum.x + mu.momentum.y*mu.momentum.y + mu.momentum.z*mu.momentum.z;
+        double mu_E  = std::sqrt(mu_p2 + mu.mass*mu.mass);
+
+        double pi2_p2      = pi2.momentum.x*pi2.momentum.x + pi2.momentum.y*pi2.momentum.y + pi2.momentum.z*pi2.momentum.z;
+        double pi2_E_muhyp = std::sqrt(pi2_p2 + m_mu*m_mu);
+
+        double Esum  = mu_E + pi2_E_muhyp;
+        double pxsum = mu.momentum.x + pi2.momentum.x;
+        double pysum = mu.momentum.y + pi2.momentum.y;
+        double pzsum = mu.momentum.z + pi2.momentum.z;
+        double m2    = Esum*Esum - (pxsum*pxsum + pysum*pysum + pzsum*pzsum);
+        double m_mumu = (m2 > 0) ? std::sqrt(m2) : -std::sqrt(-m2);
+
+        double ks_p2 = ks.momentum.x*ks.momentum.x + ks.momentum.y*ks.momentum.y + ks.momentum.z*ks.momentum.z;
+
+        res.KS_p.push_back(std::sqrt(ks_p2));
+        res.m_mumu_muhyp.push_back((float)m_mumu);
+    }
+    return res;
+}
+
+ROOT::VecOps::RVec<float> get_pimunu_KS_p(PimunuGenTruth t)        { return t.KS_p; }
+ROOT::VecOps::RVec<float> get_pimunu_m_mumu_muhyp(PimunuGenTruth t){ return t.m_mumu_muhyp; }
+
+// Pure generator-truth m_mumu for genuine (non-decayed) KS -> pi+ pi- decays,
+// under the muon-mass hypothesis applied to BOTH true pion 3-momenta. This is
+// the truth-level analogue of the "pipi misID" background (both legs
+// misidentified as muons), for direct comparison against the pimu DIF edge.
+struct PipiGenTruth {
+    ROOT::VecOps::RVec<float> m_mumu_muhyp;
+};
+
+PipiGenTruth get_KS_pipi_gentruth(
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>& mc,
+    const ROOT::VecOps::RVec<int>& daughter_ind) // Particle1 = Particle#1.index
+{
+    PipiGenTruth res;
+    constexpr double m_mu = 0.1056583755; // PDG muon mass [GeV]
+
+    auto has_muon_daughter = [&](int idx) -> bool {
+        const auto& p = mc.at(idx);
+        for (unsigned j = p.daughters_begin; j < p.daughters_end; ++j) {
+            if (j >= daughter_ind.size()) continue;
+            int dau = daughter_ind.at(j);
+            if (dau >= 0 && (size_t)dau < mc.size() && std::abs(mc.at(dau).PDG) == 13) return true;
+        }
+        return false;
+    };
+
+    for (size_t i = 0; i < mc.size(); ++i) {
+        if (mc[i].PDG != 310) continue; // KS
+        const auto& ks = mc[i];
+        if (ks.daughters_end - ks.daughters_begin != 2) continue;
+        if (ks.daughters_begin + 1 >= daughter_ind.size()) continue;
+
+        int d0 = daughter_ind.at(ks.daughters_begin);
+        int d1 = daughter_ind.at(ks.daughters_begin + 1);
+        if (d0 < 0 || d1 < 0 || (size_t)d0 >= mc.size() || (size_t)d1 >= mc.size()) continue;
+        if (std::abs(mc[d0].PDG) != 211 || std::abs(mc[d1].PDG) != 211) continue; // both pions
+
+        if (has_muon_daughter(d0) || has_muon_daughter(d1)) continue; // require genuine (undecayed) pipi
+
+        const auto& p0 = mc.at(d0);
+        const auto& p1 = mc.at(d1);
+
+        double p0_2 = p0.momentum.x*p0.momentum.x + p0.momentum.y*p0.momentum.y + p0.momentum.z*p0.momentum.z;
+        double p1_2 = p1.momentum.x*p1.momentum.x + p1.momentum.y*p1.momentum.y + p1.momentum.z*p1.momentum.z;
+        double E0 = std::sqrt(p0_2 + m_mu*m_mu);
+        double E1 = std::sqrt(p1_2 + m_mu*m_mu);
+
+        double Esum  = E0 + E1;
+        double pxsum = p0.momentum.x + p1.momentum.x;
+        double pysum = p0.momentum.y + p1.momentum.y;
+        double pzsum = p0.momentum.z + p1.momentum.z;
+        double m2    = Esum*Esum - (pxsum*pxsum + pysum*pysum + pzsum*pzsum);
+        double m_mumu = (m2 > 0) ? std::sqrt(m2) : -std::sqrt(-m2);
+
+        res.m_mumu_muhyp.push_back((float)m_mumu);
+    }
+    return res;
+}
+
+ROOT::VecOps::RVec<float> get_pipi_m_mumu_muhyp(PipiGenTruth t) { return t.m_mumu_muhyp; }
+
+// ─── Pion decay-in-tracker: muon daughter track lookup ────────────────────
+// For each V0 (indexed by V0_matched_daughters_idx), for each truth-matched
+// pion leg, check whether that pion has a muon child whose production vertex
+// is inside the tracker (vertex_r < 1500 mm, |vertex_z| < 2300 mm). If so,
+// look up the muon's reconstructed track via MCRecoAssociations and return
+// its raw (pre-vertex-fit) parameters.
+//
+// Layout of all output vectors: [V0 index][leg index (0 or 1)].
+// Zero-filled when the pion did not decay in the tracker, or when the muon
+// could not be matched to a reconstructed track.
+//
+// Parameter naming:
+//   Particle1   = Particle#1.index  (parent-link table: for particle i,
+//                 Particle[i].parents_begin..parents_end index into Particle1
+//                 to retrieve parent indices in Particle)
+//   MCRecoAssoc0 = MCRecoAssociations#0.index  (reco-particle index)
+//   MCRecoAssoc1 = MCRecoAssociations#1.index  (MC-particle index)
+struct V0PionDecayInfo {
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_r;         // muon vertex_r [mm]
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_omega;     // track curvature [1/mm]
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_omega_cov; // covMatrix[5] = sigma^2(omega)
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_tL;        // tanLambda
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_tL_cov;    // covMatrix[14] = sigma^2(tanLambda)
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_omega_tL_cov; // covMatrix[12] = cov(omega,tanLambda)
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_D0;        // impact parameter [mm]
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_D0_cov;    // covMatrix[0] = sigma^2(D0)
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_Z0;        // longitudinal impact parameter [mm]
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_Z0_cov;    // covMatrix[9] = sigma^2(Z0)
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_px;        // reco momentum x [GeV]
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_py;
+    ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> muon_pz;
+};
+
+V0PionDecayInfo get_V0_pion_decay_info(
+    const std::vector<std::vector<int>>&  daughters_idx,
+    const ROOT::VecOps::RVec<edm4hep::MCParticleData>&  Particle,
+    const ROOT::VecOps::RVec<int>&                      Particle1,
+    const ROOT::VecOps::RVec<int>&                      MCRecoAssoc0,
+    const ROOT::VecOps::RVec<int>&                      MCRecoAssoc1,
+    const ROOT::VecOps::RVec<edm4hep::ReconstructedParticleData>& reco,
+    const ROOT::VecOps::RVec<edm4hep::TrackState>&      tracks
+) {
+    // Build reverse map: children[i] = particles whose parent is i
+    int N = (int)Particle.size();
+    std::vector<std::vector<int>> children(N);
+    for (int i = 0; i < N; ++i) {
+        for (int j = (int)Particle[i].parents_begin; j < (int)Particle[i].parents_end; ++j) {
+            if (j >= 0 && j < (int)Particle1.size()) {
+                int par = Particle1[j];
+                if (par >= 0 && par < N) children[par].push_back(i);
+            }
+        }
+    }
+
+    // Build MC-index → reco-particle-index map (last association wins)
+    std::unordered_map<int,int> mc2reco;
+    for (int k = 0; k < (int)MCRecoAssoc1.size(); ++k)
+        mc2reco[MCRecoAssoc1[k]] = MCRecoAssoc0[k];
+
+    V0PionDecayInfo out;
+
+    for (const auto& v0_legs : daughters_idx) {
+        ROOT::VecOps::RVec<float> r_v, om_v, omC_v, tL_v, tLC_v, omtLC_v;
+        ROOT::VecOps::RVec<float> D0_v, D0C_v, Z0_v, Z0C_v, px_v, py_v, pz_v;
+        for (int pi_idx : v0_legs) {
+            float mu_r=0.f, mu_om=0.f, mu_omC=0.f, mu_tL=0.f, mu_tLC=0.f, mu_omtLC=0.f;
+            float mu_D0=0.f, mu_D0C=0.f, mu_Z0=0.f, mu_Z0C=0.f;
+            float mu_px=0.f, mu_py=0.f, mu_pz=0.f;
+
+            if (pi_idx >= 0 && pi_idx < N) {
+                int mu_mc = -1;
+                for (int ch : children[pi_idx]) {
+                    if (std::abs(Particle[ch].PDG) != 13) continue;
+                    float vx = Particle[ch].vertex.x;
+                    float vy = Particle[ch].vertex.y;
+                    float vz = Particle[ch].vertex.z;
+                    float vr = std::sqrt(vx*vx + vy*vy);
+                    if (vr > 1.f && vr < 1500.f && std::abs(vz) < 2300.f) {
+                        mu_r  = vr;
+                        mu_mc = ch;
+                        break;
+                    }
+                }
+                if (mu_mc >= 0) {
+                    auto it = mc2reco.find(mu_mc);
+                    if (it != mc2reco.end()) {
+                        int ri = it->second;
+                        if (ri >= 0 && ri < (int)reco.size()) {
+                            int ti = reco[ri].tracks_begin;
+                            if (ti >= 0 && ti < (int)tracks.size()) {
+                                mu_om    = tracks[ti].omega;
+                                mu_omC   = tracks[ti].covMatrix[5];
+                                mu_tL    = tracks[ti].tanLambda;
+                                mu_tLC   = tracks[ti].covMatrix[14];
+                                mu_omtLC = tracks[ti].covMatrix[12];
+                                mu_D0    = tracks[ti].D0;
+                                mu_D0C   = tracks[ti].covMatrix[0];
+                                mu_Z0    = tracks[ti].Z0;
+                                mu_Z0C   = tracks[ti].covMatrix[9];
+                            }
+                            const auto& m = reco[ri].momentum;
+                            mu_px = m.x; mu_py = m.y; mu_pz = m.z;
+                        }
+                    }
+                }
+            }
+            r_v.push_back(mu_r);       om_v.push_back(mu_om);     omC_v.push_back(mu_omC);
+            tL_v.push_back(mu_tL);     tLC_v.push_back(mu_tLC);   omtLC_v.push_back(mu_omtLC);
+            D0_v.push_back(mu_D0);     D0C_v.push_back(mu_D0C);
+            Z0_v.push_back(mu_Z0);     Z0C_v.push_back(mu_Z0C);
+            px_v.push_back(mu_px);     py_v.push_back(mu_py);     pz_v.push_back(mu_pz);
+        }
+        out.muon_r.push_back(r_v);        out.muon_omega.push_back(om_v);
+        out.muon_omega_cov.push_back(omC_v);
+        out.muon_tL.push_back(tL_v);      out.muon_tL_cov.push_back(tLC_v);
+        out.muon_omega_tL_cov.push_back(omtLC_v);
+        out.muon_D0.push_back(D0_v);      out.muon_D0_cov.push_back(D0C_v);
+        out.muon_Z0.push_back(Z0_v);      out.muon_Z0_cov.push_back(Z0C_v);
+        out.muon_px.push_back(px_v);      out.muon_py.push_back(py_v);
+        out.muon_pz.push_back(pz_v);
+    }
+    return out;
+}
+
+// Flat accessors for the V0PionDecayInfo struct (one per field)
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_r           (V0PionDecayInfo d) { return d.muon_r; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_omega       (V0PionDecayInfo d) { return d.muon_omega; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_omega_cov   (V0PionDecayInfo d) { return d.muon_omega_cov; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_tL          (V0PionDecayInfo d) { return d.muon_tL; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_tL_cov      (V0PionDecayInfo d) { return d.muon_tL_cov; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_omega_tL_cov(V0PionDecayInfo d) { return d.muon_omega_tL_cov; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_D0          (V0PionDecayInfo d) { return d.muon_D0; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_D0_cov      (V0PionDecayInfo d) { return d.muon_D0_cov; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_Z0          (V0PionDecayInfo d) { return d.muon_Z0; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_Z0_cov      (V0PionDecayInfo d) { return d.muon_Z0_cov; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_px          (V0PionDecayInfo d) { return d.muon_px; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_py          (V0PionDecayInfo d) { return d.muon_py; }
+ROOT::VecOps::RVec<ROOT::VecOps::RVec<float>> get_V0_muon_pz          (V0PionDecayInfo d) { return d.muon_pz; }
 
 }}
 
 #endif
-
